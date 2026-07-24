@@ -1,3 +1,6 @@
+.vs/
+build/
+out/
 # Prerequisites
 *.d
 
