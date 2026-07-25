@@ -15,7 +15,23 @@ if (POLICY CMP0141)
     endif()
 endif()
 
-find_package(Boost REQUIRED COMPONENTS asio)
+include(FetchContent)
+
+FetchContent_Declare(
+	ScorchProtocol
+	GIT_REPOSITORY https://github.com/nate3223/scorch-protocol.git
+	GIT_TAG main
+)
+FetchContent_MakeAvailable(ScorchProtocol)
+
+FetchContent_Declare(
+    keychain
+    GIT_REPOSITORY https://github.com/hrantzsch/keychain.git
+    GIT_TAG        v1.3.1
+)
+FetchContent_MakeAvailable(keychain)
+
+find_package(Boost REQUIRED COMPONENTS asio uuid)
 find_package(OpenSSL REQUIRED)
 
 # Create an executable
@@ -23,8 +39,11 @@ add_executable(${PROJECT_NAME}
 	src/main.cpp
 	
 	src/Agent/Agent.cpp
+	src/Agent/AgentCredentials.cpp
 
 	src/ASIO/ASIOManager.cpp
+
+	src/Keychain/KeychainUtils.cpp
 
 	src/Log/Logger.cpp
 )
@@ -36,8 +55,11 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Boost::asio
+	Boost::uuid
     OpenSSL::SSL
     OpenSSL::Crypto
+	Scorch::Protocol
+	keychain
 )
 
 if(NOT TARGET spdlog)
@@ -52,5 +74,6 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 	src
 	src/Agent
 	src/ASIO
+	src/Keychain
 	src/Log
 )

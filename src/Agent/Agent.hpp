@@ -6,6 +6,15 @@
 
 class AgentPrivate;
 
+enum class AgentState
+{
+	Disconnected,
+	Connecting,
+	Pairing,
+	Authenticating,
+	Connected,
+};
+
 class Agent
 {
 public:
@@ -13,6 +22,8 @@ public:
 									~Agent();
 
 	boost::asio::awaitable<void>	run();
+
+	AgentState						state() const;
 
 private:
 	std::unique_ptr<AgentPrivate>	m_p;

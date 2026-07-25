@@ -1,6 +1,10 @@
 #include "ASIOManager.hpp"
 #include "ASIOManager_p.hpp"
 
+#include "Logger.hpp"
+
+#include <cstdlib>
+
 ASIOManager& ASIOManager::Instance()
 {
 	static ASIOManager gManager;
@@ -32,8 +36,19 @@ ASIOManagerPrivate::ASIOManagerPrivate()
 		m_ioContext.run();
 	})
 {
-	// Use the OS's trusted CAs
-	m_sslContext.set_default_verify_paths();
+	const auto envValue = std::getenv("DISABLE_SSL_VERIFY");
+	const bool disableSSLVerification = (envValue != nullptr && std::string(envValue) == "1");
+	if (disableSSLVerification)
+	{
+		Logger::Instance().warn("SSL Verification Disabled. Be careful");
+		m_sslContext.set_verify_mode(boost::asio::ssl::verify_none);
+	}
+	else
+	{
+		// Use the OS's trusted CAs
+		m_sslContext.set_verify_mode(boost::asio::ssl::verify_peer);
+		m_sslContext.set_default_verify_paths();
+	}
 }
 
 ASIOManagerPrivate::~ASIOManagerPrivate()
