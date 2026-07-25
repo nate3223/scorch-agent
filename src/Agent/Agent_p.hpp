@@ -5,6 +5,7 @@
 #include "Logger.hpp"
 
 #include <boost/asio.hpp>
+#include <boost/asio/buffer.hpp>
 #include <boost/asio/ssl.hpp>
 
 #include <capnp/message.h>
@@ -61,7 +62,7 @@ public:
 		requires std::invocable<Callback, scorch::protocol::ServerMessage::Reader&>
 	asio::awaitable<void>			readServerMessage(Callback&& callback)
 	{
-		auto response = read();
+		auto response = co_await read();
 
 		if (response.size() % sizeof(capnp::word) != 0)
 			throw std::runtime_error("Invalid Cap'n Proto message size");
