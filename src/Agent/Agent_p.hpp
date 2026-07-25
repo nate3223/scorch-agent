@@ -7,6 +7,10 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 
+#include <capnp/message.h>
+#include <capnp/serialize.h>
+#include <ScorchProtocol.capnp.h>
+
 #include <optional>
 #include <string>
 #include <string_view>
@@ -41,6 +45,42 @@ public:
 	asio::awaitable<Buffer>			read();
 	asio::awaitable<void>			handleMessage(std::string_view message);
 
+	template <typename Callback>
+		requires std::invocable<Callback, scorch::protocol::AgentMessage::Builder&>
+	asio::awaitable<void>			sendAgentMessage(Callback&& callback)
+	{
+		capnp::MallocMessageBuilder message;
+		auto agentMessage = message.initRoot<scorch::protocol::AgentMessage>();
+
+		callback(agentMessage);
+
+		co_await writeMessage(message);
+	}
+
+	template <typename Callback>
+		requires std::invocable<Callback, scorch::protocol::ServerMessage::Reader&>
+	asio::awaitable<void>			readServerMessage(Callback&& callback)
+	{
+		auto response = read();
+
+		if (response.size() % sizeof(capnp::word) != 0)
+			throw std::runtime_error("Invalid Cap'n Proto message size");
+
+		auto reader = capnp::FlatArrayMessageReader(
+			kj::ArrayPtr<const capnp::word>(
+				reinterpret_cast<const capnp::word*>(response.data()),
+				response.size() / sizeof(capnp::word)
+			)
+		);
+
+		auto serverMessage = reader.getRoot<scorch::protocol::ServerMessage>();
+
+		callback(serverMessage);
+
+		co_return;
+	}
+
+	asio::awaitable<void>			writeMessage(capnp::MallocMessageBuilder& message);
 
 	void							close(Context&& ctx);
 

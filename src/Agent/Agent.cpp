@@ -6,10 +6,6 @@
 
 #include <boost/asio/buffer.hpp>
 
-#include <ScorchProtocol.capnp.h>
-#include <capnp/message.h>
-#include <capnp/serialize.h>
-
 #include <format>
 #include <optional>
 
@@ -17,6 +13,7 @@ namespace
 {
 	constexpr auto kHostname = "localhost";
 	constexpr auto kPort = "3224";
+	constexpr std::uint32_t kMaxMessageSize = 1024 * 1024;
 }
 
 template <>
@@ -53,9 +50,6 @@ asio::awaitable<void> Agent::run()
 				m_p->m_context.reset();
 				m_p->m_context.emplace(co_await m_p->connect(kHostname, kPort));
 				co_await m_p->eventLoop();
-
-				co_await m_p->authenticate();
-				co_await m_p->listen();
 			}
 			catch (const std::exception& e)
 			{
@@ -150,6 +144,8 @@ asio::awaitable<void> AgentPrivate::eventLoop()
 asio::awaitable<void> AgentPrivate::authenticate()
 {
 	assert(m_state == AgentState::Connecting || m_state == AgentState::Authenticating);
+	bool success = true;
+
 	if (! m_credentials.getUUID().has_value())
 	{
 		setState(AgentState::Pairing);
@@ -161,37 +157,19 @@ asio::awaitable<void> AgentPrivate::authenticate()
 	m_logger.info("Authenticating...");
 	setState(AgentState::Authenticating);
 
-	{
-		capnp::MallocMessageBuilder message;
-
-		auto agentMessage = message.initRoot<scorch::protocol::AgentMessage>();
+	co_await sendAgentMessage([uuid](auto& agentMessage) {
 		auto authInit = agentMessage.initAuthenticationInitiation();
-
 		authInit.setUuid(kj::StringPtr(uuid.data(), uuid.size()));
-
-		kj::Array<capnp::word> serialised = capnp::messageToFlatArray(message);
-		auto bytes = serialised.asBytes();
-
-		co_await asio::async_write(m_context->socket, asio::buffer(bytes.begin(), bytes.size()), asio::use_awaitable);
-	}
+	});
 
 	std::string signature;
 
-	{
-		auto response = co_await read();
-
-		capnp::FlatArrayMessageReader reader(
-			kj::ArrayPtr<const capnp::word>(
-				reinterpret_cast<const capnp::word*>(response.data()),
-				response.size() / sizeof(capnp::word)
-			)
-		);
-
-		auto serverMessage = reader.getRoot<scorch::protocol::ServerMessage>();
+	co_await readServerMessage([this, &signature, &success](auto& serverMessage) {
 		if (! serverMessage.isAuthenticationInitiation())
 		{
 			m_logger.error("Unexpected server response. Expected AuthenticationInitiation");
-			co_return;
+			success = false;
+			return;
 		}
 
 		auto authInitResponse = serverMessage.getAuthenticationInitiation();
@@ -199,12 +177,14 @@ asio::awaitable<void> AgentPrivate::authenticate()
 		{
 			m_logger.info("Server says UUID is invalid. Requesting new pairing code.");
 			setState(AgentState::Pairing);
-			co_return;
+			success = false;
+			return;
 		}
 		else if (! authInitResponse.isChallenge())
 		{
 			m_logger.error("AuthenticationInitiation was not successful for an unknown reason.");
-			co_return;
+			success = false;
+			return;
 		}
 
 		auto challengeMessage = authInitResponse.getChallenge().getChallenge();
@@ -215,12 +195,11 @@ asio::awaitable<void> AgentPrivate::authenticate()
 
 		m_logger.debug("Challenge received. Signing");
 		signature = m_credentials.signChallenge(challenge);
-	}
+	});
+	if (! success)
+		co_return;
 
-	{
-		capnp::MallocMessageBuilder message;
-
-		auto agentMessage = message.initRoot<scorch::protocol::AgentMessage>();
+	co_await sendAgentMessage([signature = std::move(signature)](auto& agentMessage) {
 		auto authReq = agentMessage.initAuthenticationRequest();
 
 		authReq.setSignature(
@@ -229,42 +208,32 @@ asio::awaitable<void> AgentPrivate::authenticate()
 				signature.size()
 			)
 		);
+	});
 
-		kj::Array<capnp::word> serialised = capnp::messageToFlatArray(message);
-		auto bytes = serialised.asBytes();
-
-		co_await asio::async_write(m_context->socket, asio::buffer(bytes.begin(), bytes.size()), asio::use_awaitable);
-	}
-
-	{
-		auto response = co_await read();
-
-		capnp::FlatArrayMessageReader reader(
-			kj::ArrayPtr<const capnp::word>(
-				reinterpret_cast<const capnp::word*>(response.data()),
-				response.size() / sizeof(capnp::word)
-			)
-		);
-
-		auto serverMessage = reader.getRoot<scorch::protocol::ServerMessage>();
+	co_await readServerMessage([this, &success](auto& serverMessage) {
 		if (! serverMessage.isAuthenticationResult())
 		{
 			m_logger.error("Unexpected server response. Expected AuthenticationResult");
-			co_return;
+			success = false;
+			return;
 		}
 
 		auto authResult = serverMessage.getAuthenticationResult();
 		if (authResult.isChallengeFailed())
 		{
 			m_logger.error("Challenge failed. Retrying");
-			co_return;
+			success = false;
+			return;
 		}
 		else if (! authResult.isSuccess())
 		{
 			m_logger.error("Authentication Request was not successful for an unknown reason");
-			co_return;
+			success = false;
+			return;
 		}
-	}
+	});
+	if (! success)
+		co_return;
 
 	m_logger.info("Authentication successful");
 	setState(AgentState::Connected);
@@ -275,11 +244,9 @@ asio::awaitable<void> AgentPrivate::authenticate()
 asio::awaitable<void> AgentPrivate::pair()
 {
 	assert(m_state == AgentState::Pairing);
+	bool success = true;
 
-	{
-		capnp::MallocMessageBuilder message;
-
-		auto agentMessage = message.initRoot<scorch::protocol::AgentMessage>();
+	co_await sendAgentMessage([this](auto& agentMessage) {
 		auto pairRequest = agentMessage.initPair();
 
 		std::string_view uuid = m_credentials.generateUUID();
@@ -290,69 +257,53 @@ asio::awaitable<void> AgentPrivate::pair()
 				m_credentials.getPublicKey().size()
 			)
 		);
-
-		kj::Array<capnp::word> serialised = capnp::messageToFlatArray(message);
-		auto bytes = serialised.asBytes();
-
-		co_await asio::async_write(m_context->socket, asio::buffer(bytes.begin(), bytes.size()), asio::use_awaitable);
-	}
+	});
 
 	std::string pairCode;
 
-	{
-		auto response = co_await read();
-
-		capnp::FlatArrayMessageReader reader(
-			kj::ArrayPtr<const capnp::word>(
-				reinterpret_cast<const capnp::word*>(response.data()),
-				response.size() / sizeof(capnp::word)
-			)
-		);
-
-		auto serverMessage = reader.getRoot<scorch::protocol::ServerMessage>();
+	co_await readServerMessage([this, &success, &pairCode](auto& serverMessage) {
 		if (! serverMessage.isPairCode())
 		{
 			m_logger.error("Unexpected server response. Expected PairCode");
-			co_return;
+			success = false;
+			return;
 		}
 
 		pairCode = serverMessage.getPairCode().getCode().cStr();
-	}
+	});
+	if (! success)
+		co_return;
 
 	m_logger.info(std::format("Pairing Code received: {}", pairCode));
-	{
-		// Await user entering pair code
-		auto response = co_await read();
 
-		capnp::FlatArrayMessageReader reader(
-			kj::ArrayPtr<const capnp::word>(
-				reinterpret_cast<const capnp::word*>(response.data()),
-				response.size() / sizeof(capnp::word)
-			)
-		);
-
-		auto serverMessage = reader.getRoot<scorch::protocol::ServerMessage>();
+	// Await user entering pair code
+	co_await readServerMessage([this, &success](auto& serverMessage) {
 		if (! serverMessage.isPairingResult())
 		{
 			m_logger.error("Unexpected server response. Expected PairingResult");
-			co_return;
+			success = false;
+			return;
 		}
 
 		auto pairingResult = serverMessage.getPairingResult();
 		if (pairingResult.isTimedOut())
 		{
 			m_logger.info("Pairing timed out. Requesting new Pairing Code");
-			co_return;
+			success = false;
+			return;
 		}
 		else if (! pairingResult.isSuccess())
 		{
 			m_logger.error("Pairing was not succesful due to an unknown reason");
-			co_return;
+			success = false;
+			return;
 		}
+	});
+	if (! success)
+		co_return;
 
-		m_logger.info("Pairing successful");
-		setState(AgentState::Authenticating);
-	}
+	m_logger.info("Pairing successful");
+	setState(AgentState::Authenticating);
 }
 
 asio::awaitable<void> AgentPrivate::listen()
@@ -378,6 +329,8 @@ asio::awaitable<Buffer> AgentPrivate::read()
 	);
 
 	size = ntohl(size);
+	if (size > kMaxMessageSize)
+		throw std::runtime_error("Message too large");
 
 	Buffer buffer(size);
 
@@ -393,6 +346,26 @@ asio::awaitable<Buffer> AgentPrivate::read()
 asio::awaitable<void> AgentPrivate::handleMessage(std::string_view message)
 {
 	co_return;
+}
+
+asio::awaitable<void> AgentPrivate::writeMessage(capnp::MallocMessageBuilder& message)
+{
+	auto serialized = capnp::messageToFlatArray(message);
+	auto bytes = serialized.asBytes();
+
+	std::uint32_t size = htonl(static_cast<std::uint32_t>(bytes.size()));
+
+	co_await asio::async_write(
+		m_context->socket,
+		asio::buffer(&size, sizeof(size)),
+		asio::use_awaitable
+	);
+
+	co_await asio::async_write(
+		m_context->socket,
+		asio::buffer(bytes.begin(), bytes.size()),
+		asio::use_awaitable
+	);
 }
 
 void AgentPrivate::close(Context&& ctx)
