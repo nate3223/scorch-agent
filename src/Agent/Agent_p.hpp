@@ -22,6 +22,8 @@ namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 using TLSSocket = asio::ssl::stream<tcp::socket>;
 using Buffer = std::vector<std::byte>;
+using AgentMessage = scorch::protocol::AgentMessage::Builder;
+using ServerMessage = scorch::protocol::ServerMessage::Reader;
 
 class AgentPrivate
 {
@@ -47,11 +49,11 @@ public:
 	asio::awaitable<void>			handleMessage(std::string_view message);
 
 	template <typename Callback>
-		requires std::invocable<Callback, scorch::protocol::AgentMessage::Builder&>
+		requires std::invocable<Callback, AgentMessage&>
 	asio::awaitable<void>			sendAgentMessage(Callback&& callback)
 	{
 		capnp::MallocMessageBuilder message;
-		auto agentMessage = message.initRoot<scorch::protocol::AgentMessage>();
+		AgentMessage agentMessage = message.initRoot<scorch::protocol::AgentMessage>();
 
 		callback(agentMessage);
 
@@ -59,7 +61,7 @@ public:
 	}
 
 	template <typename Callback>
-		requires std::invocable<Callback, scorch::protocol::ServerMessage::Reader&>
+		requires std::invocable<Callback, ServerMessage&>
 	asio::awaitable<void>			readServerMessage(Callback&& callback)
 	{
 		auto response = co_await read();
@@ -74,7 +76,7 @@ public:
 			)
 		);
 
-		auto serverMessage = reader.getRoot<scorch::protocol::ServerMessage>();
+		ServerMessage serverMessage = reader.getRoot<scorch::protocol::ServerMessage>();
 
 		callback(serverMessage);
 

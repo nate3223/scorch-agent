@@ -5,6 +5,7 @@
 #include "Logger.hpp"
 
 #include <format>
+#include <iostream>
 #include <optional>
 
 namespace
@@ -155,14 +156,14 @@ asio::awaitable<void> AgentPrivate::authenticate()
 	m_logger.info("Authenticating...");
 	setState(AgentState::Authenticating);
 
-	co_await sendAgentMessage([uuid](auto& agentMessage) {
+	co_await sendAgentMessage([uuid](AgentMessage& agentMessage) {
 		auto authInit = agentMessage.initAuthenticationInitiation();
 		authInit.setUuid(kj::StringPtr(uuid.data(), uuid.size()));
 	});
 
 	std::string signature;
 
-	co_await readServerMessage([this, &signature, &success](auto& serverMessage) {
+	co_await readServerMessage([this, &signature, &success](ServerMessage& serverMessage) {
 		if (! serverMessage.isAuthenticationInitiation())
 		{
 			m_logger.error("Unexpected server response. Expected AuthenticationInitiation");
@@ -192,12 +193,21 @@ asio::awaitable<void> AgentPrivate::authenticate()
 		);
 
 		m_logger.debug("Challenge received. Signing");
-		signature = m_credentials.signChallenge(challenge);
+		try
+		{
+			signature = m_credentials.signChallenge(challenge);
+		}
+		catch (const std::exception& e)
+		{
+			m_logger.error("Failed to sign challenge: {}", e.what());
+			success = false;
+			return;
+		}
 	});
 	if (! success)
 		co_return;
 
-	co_await sendAgentMessage([signature = std::move(signature)](auto& agentMessage) {
+	co_await sendAgentMessage([&signature](AgentMessage& agentMessage) {
 		auto authReq = agentMessage.initAuthenticationRequest();
 
 		authReq.setSignature(
@@ -208,7 +218,7 @@ asio::awaitable<void> AgentPrivate::authenticate()
 		);
 	});
 
-	co_await readServerMessage([this, &success](auto& serverMessage) {
+	co_await readServerMessage([this, &success](ServerMessage& serverMessage) {
 		if (! serverMessage.isAuthenticationResult())
 		{
 			m_logger.error("Unexpected server response. Expected AuthenticationResult");
@@ -244,7 +254,7 @@ asio::awaitable<void> AgentPrivate::pair()
 	assert(m_state == AgentState::Pairing);
 	bool success = true;
 
-	co_await sendAgentMessage([this](auto& agentMessage) {
+	co_await sendAgentMessage([this](AgentMessage& agentMessage) {
 		auto pairRequest = agentMessage.initPair();
 
 		std::string_view uuid = m_credentials.generateUUID();
@@ -259,7 +269,7 @@ asio::awaitable<void> AgentPrivate::pair()
 
 	std::string pairCode;
 
-	co_await readServerMessage([this, &success, &pairCode](auto& serverMessage) {
+	co_await readServerMessage([this, &success, &pairCode](ServerMessage& serverMessage) {
 		if (! serverMessage.isPairCode())
 		{
 			m_logger.error("Unexpected server response. Expected PairCode");
@@ -267,15 +277,24 @@ asio::awaitable<void> AgentPrivate::pair()
 			return;
 		}
 
-		pairCode = serverMessage.getPairCode().getCode().cStr();
+		auto pairCodeResult = serverMessage.getPairCode();
+		if (! pairCodeResult.isValid())
+		{
+			m_logger.info("Server rejected UUID. Retrying");
+			success = false;
+			return;
+		}
+
+		pairCode = pairCodeResult.getValid().getCode();
 	});
 	if (! success)
 		co_return;
 
 	m_logger.info(std::format("Pairing Code received: {}", pairCode));
 
+	std::string pairingInfo;
 	// Await user entering pair code
-	co_await readServerMessage([this, &success](auto& serverMessage) {
+	co_await readServerMessage([this, &success, &pairingInfo](ServerMessage& serverMessage) {
 		if (! serverMessage.isPairingResult())
 		{
 			m_logger.error("Unexpected server response. Expected PairingResult");
@@ -296,11 +315,26 @@ asio::awaitable<void> AgentPrivate::pair()
 			success = false;
 			return;
 		}
+		
 	});
 	if (! success)
 		co_return;
 
-	m_logger.info("Pairing successful");
+	m_logger.info("Pairing request confirmed");
+	m_logger.info(pairingInfo);
+	std::cout << "Did you authorize this pairing request? [y/N]: " << std::flush;
+	std::string response;
+	std::getline(std::cin, response);
+
+	const bool authorised = response == "y" || response == "Y";
+	co_await sendAgentMessage([authorised](AgentMessage& agentMessage) {
+		auto pairingConfirmation = agentMessage.initPairingConfirmation();
+		if (authorised)
+			pairingConfirmation.setApproved();
+		else
+			pairingConfirmation.setRejected();
+	});
+
 	setState(AgentState::Authenticating);
 }
 
