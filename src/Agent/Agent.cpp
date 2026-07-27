@@ -278,12 +278,14 @@ asio::awaitable<void> AgentPrivate::pair()
 		}
 
 		auto pairCodeResult = serverMessage.getPairCode();
-		if (! pairCodeResult.isValid())
-		{
+		success = pairCodeResult.isValid();
+		if (pairCodeResult.isInvalid())
 			m_logger.info("Server rejected UUID. Retrying");
-			success = false;
+		else if (pairCodeResult.isRetry())
+			m_logger.info("Server asked to request for another pairing code. Retrying");
+
+		if (! success)
 			return;
-		}
 
 		pairCode = pairCodeResult.getValid().getCode();
 	});
@@ -315,14 +317,14 @@ asio::awaitable<void> AgentPrivate::pair()
 			success = false;
 			return;
 		}
-		
+		auto pairingSuccess = pairingResult.getSuccess();
+		pairingInfo = pairingSuccess.getPairingInfo();
 	});
 	if (! success)
 		co_return;
 
-	m_logger.info("Pairing request confirmed");
-	m_logger.info(pairingInfo);
-	std::cout << "Did you authorize this pairing request? [y/N]: " << std::flush;
+	m_logger.info("Pairing request confirmed: {}", pairingInfo);
+	std::cout << "Did you authorize this pairing request? " << pairingInfo << " [y / N]: " << std::flush;
 	std::string response;
 	std::getline(std::cin, response);
 

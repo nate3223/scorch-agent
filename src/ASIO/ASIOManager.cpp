@@ -53,5 +53,6 @@ ASIOManagerPrivate::ASIOManagerPrivate()
 
 ASIOManagerPrivate::~ASIOManagerPrivate()
 {
+	m_workGuard.reset();
 	m_ioContext.stop();
 }
