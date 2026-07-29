@@ -31,7 +31,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(keychain)
 
-find_package(Boost REQUIRED COMPONENTS asio uuid)
+find_package(Boost REQUIRED COMPONENTS asio beast uuid)
 find_package(OpenSSL REQUIRED)
 
 if(NOT TARGET spdlog)
@@ -61,8 +61,15 @@ target_sources(${PROJECT_NAME}
 		src/Keychain/KeychainUtils.cpp
 		src/Keychain/KeychainUtils.hpp
 
+		src/HTTP/HTTPClient.cpp
+		src/HTTP/HTTPClient.hpp
+
 		src/Log/Logger.cpp
 		src/Log/Logger.hpp
+	)
+
+set_source_files_properties(src/HTTP/HTTPClient.cpp PROPERTIES
+	COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:MSVC>:/bigobj>"
 )
 
 target_compile_features(${PROJECT_NAME}
@@ -90,6 +97,7 @@ target_include_directories(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME}
 	PRIVATE
 		Boost::asio
+		Boost::beast
 		Boost::uuid
 		OpenSSL::SSL
 		OpenSSL::Crypto
@@ -105,6 +113,7 @@ if(PROJECT_IS_TOP_LEVEL)
 	if(BUILD_TESTING)
 		add_executable(ScorchAgentControlFlowTests
 			tests/AgentControlFlowTests.cpp
+			src/HTTP/HTTPClient.cpp
 		)
 
 		target_compile_features(ScorchAgentControlFlowTests PRIVATE cxx_std_23)
@@ -114,6 +123,7 @@ if(PROJECT_IS_TOP_LEVEL)
 		target_link_libraries(ScorchAgentControlFlowTests PRIVATE
 			Scorch::Protocol
 			Boost::asio
+			Boost::beast
 			Boost::uuid
 			OpenSSL::SSL
 			OpenSSL::Crypto

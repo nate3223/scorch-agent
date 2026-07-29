@@ -274,6 +274,8 @@ public:
 	asio::awaitable<void>			handleConnectedMessage(std::shared_ptr<Context> context, ReceivedMessage receive);
 	asio::awaitable<void>			onHeartbeat(std::shared_ptr<Context> context, scorch::protocol::Heartbeat::Reader heartbeat, std::uint64_t requestId);
 	asio::awaitable<void>			onCommandRequest(std::shared_ptr<Context> context, scorch::protocol::CommandRequest::Reader request, std::uint64_t requestId);
+	asio::awaitable<void>			onShareRequest(std::shared_ptr<Context> context, scorch::protocol::ShareRequest::Reader request, std::uint64_t requestId);
+	asio::awaitable<bool>			requestShareApproval(std::string info);
 	void							onResponse(const std::shared_ptr<Context>& context, ServerMessage response);
 	asio::awaitable<void>			sendProtocolError(std::shared_ptr<Context> context, std::uint64_t replyTo, std::string_view message);
 
@@ -348,6 +350,7 @@ public:
 	void								disconnect(const std::shared_ptr<Context>& context);
 
 	asio::strand<asio::any_io_executor>	m_strand;
+	asio::thread_pool					m_consoleThread{ 1 };
 	tcp::resolver						m_resolver;
 	spdlog::logger&						m_logger;
 

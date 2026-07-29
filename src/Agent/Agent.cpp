@@ -2,11 +2,13 @@
 #include "Agent_p.hpp"
 
 #include "ASIO/ASIOManager.hpp"
+#include "HTTP/HTTPClient.hpp"
 #include "Log/Logger.hpp"
 
 #include <cstring>
 #include <format>
 #include <iostream>
+#include <limits>
 #include <optional>
 
 namespace
@@ -487,6 +489,10 @@ asio::awaitable<void> AgentPrivate::handleConnectedMessage(std::shared_ptr<Conte
 			co_await onCommandRequest(context, received.message.getCommand(), messageId);
 			break;
 
+		case scorch::protocol::ServerMessage::SHARE_REQUEST:
+			co_await onShareRequest(context, received.message.getShareRequest(), messageId);
+			break;
+
 		case scorch::protocol::ServerMessage::ERROR:
 			m_logger.error(
 				"Received uncorrelated protocol error from server: {}",
@@ -541,6 +547,38 @@ asio::awaitable<void> AgentPrivate::onCommandRequest(std::shared_ptr<Context> co
 	co_return;
 }
 
+asio::awaitable<void> AgentPrivate::onShareRequest(
+	std::shared_ptr<Context> context,
+	scorch::protocol::ShareRequest::Reader request,
+	uint64_t requestId
+)
+{
+	const bool approved = co_await requestShareApproval(request.getInfo().cStr());
+
+	co_await sendAgentMessage([approved](AgentMessage& agentMessage) {
+		auto confirmation = agentMessage.initShareConfirmation();
+		if (approved)
+			confirmation.setApproved();
+		else
+			confirmation.setRejected();
+	}, nextMessageId(context), requestId, context);
+}
+
+asio::awaitable<bool> AgentPrivate::requestShareApproval(std::string info)
+{
+	co_return co_await asio::co_spawn(
+		m_consoleThread,
+		[info = std::move(info)]() -> asio::awaitable<bool> {
+			std::cout << "Share request: " << info << "\nAuthorize sharing this agent? [y / N]: " << std::flush;
+
+			std::string response;
+			std::getline(std::cin, response);
+			co_return response == "y" || response == "Y";
+		},
+		asio::use_awaitable
+	);
+}
+
 void AgentPrivate::onResponse(const std::shared_ptr<Context>& context, ServerMessage response)
 {
 	const uint64_t replyTo = response.getReplyTo();
@@ -567,15 +605,89 @@ asio::awaitable<void> AgentPrivate::sendProtocolError(std::shared_ptr<Context> c
 
 asio::awaitable<void> AgentPrivate::onHTTPCommand(std::shared_ptr<Context> context, scorch::protocol::HttpCommand::Reader command, uint64_t requestId)
 {
-	const std::string errorMessage = std::format(
-		"HTTP command for {} is not implemented",
-		command.getUrl().cStr()
-	);
-	m_logger.warn(errorMessage);
+	scorch::agent::http::Request request;
+	request.url = command.getUrl().cStr();
+	request.method = command.getMethod().cStr();
 
-	co_await sendAgentMessage([errorMessage](AgentMessage& agentMessage) {
-		agentMessage.initCommand().setError(
-			kj::StringPtr(errorMessage.data(), errorMessage.size())
+	const auto requestHeaders = command.getHeaders();
+	request.headers.reserve(requestHeaders.size());
+	for (const auto header : requestHeaders)
+	{
+		request.headers.push_back({
+			header.getName().cStr(),
+			header.getValue().cStr()
+		});
+	}
+
+	const auto requestBody = command.getBody();
+	request.body.assign(
+		reinterpret_cast<const std::byte*>(requestBody.begin()),
+		reinterpret_cast<const std::byte*>(requestBody.end())
+	);
+
+	std::optional<scorch::agent::http::Response> response;
+	std::string errorMessage;
+	try
+	{
+		response = co_await scorch::agent::http::Execute(
+			std::move(request),
+			ASIOManager::Instance().sslContext()
+		);
+	}
+	catch (const std::exception& error)
+	{
+		errorMessage = std::format("HTTP request failed: {}", error.what());
+		m_logger.warn("HTTP command {} failed: {}", requestId, error.what());
+	}
+
+	if (! response)
+	{
+		co_await sendAgentMessage([errorMessage](AgentMessage& agentMessage) {
+			auto commandResponse = agentMessage.initCommand();
+			commandResponse.setTimestamp(
+				std::chrono::duration_cast<std::chrono::milliseconds>(
+					std::chrono::system_clock::now().time_since_epoch()
+				).count()
+			);
+			commandResponse.setError(
+				kj::StringPtr(errorMessage.data(), errorMessage.size())
+			);
+		}, nextMessageId(context), requestId, context);
+		co_return;
+	}
+
+	m_logger.info(
+		"HTTP command {} completed with status {}",
+		requestId,
+		response->status
+	);
+
+	co_await sendAgentMessage([response = std::move(*response)](AgentMessage& agentMessage) {
+		auto commandResponse = agentMessage.initCommand();
+		commandResponse.setTimestamp(
+			std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::system_clock::now().time_since_epoch()
+			).count()
+		);
+
+		auto httpResponse = commandResponse.initHttpResponse();
+		httpResponse.setStatusCode(response.status);
+
+		if (response.headers.size() > std::numeric_limits<capnp::uint>::max())
+			throw std::length_error("Too many HTTP response headers");
+
+		auto headers = httpResponse.initHeaders(static_cast<capnp::uint>(response.headers.size()));
+		for (capnp::uint i = 0; i < headers.size(); ++i)
+		{
+			headers[i].setName(response.headers[i].name);
+			headers[i].setValue(response.headers[i].value);
+		}
+
+		httpResponse.setBody(
+			kj::ArrayPtr<const kj::byte>(
+				reinterpret_cast<const kj::byte*>(response.body.data()),
+				response.body.size()
+			)
 		);
 	}, nextMessageId(context), requestId, context);
 }
