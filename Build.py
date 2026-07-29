@@ -49,7 +49,7 @@ if __name__ == "__main__":
 	BUILDROOT.mkdir(exist_ok=True)
 
 	configure_args = []
-	build_args = []
+	build_args = ["--config", "Release"]
 
 	if shutil.which("ninja"):
 		configure_args.extend(["-G", "Ninja"])

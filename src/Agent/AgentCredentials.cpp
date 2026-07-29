@@ -152,9 +152,8 @@ AgentCredentialsPrivate::AgentCredentialsPrivate()
 		KeychainUtils::Save(kPublicKey, m_publicKey);
 	}
 
-	static bool gFirst = true;
 	std::optional<std::string> uuid = KeychainUtils::Load(kUUID);
-	if (! gFirst && uuid)
+	if (uuid.has_value())
 	{
 		m_uuid = std::move(*uuid);
 		Logger::Instance().info(std::format("Retrieved UUID from keychain: {}", *m_uuid));
@@ -163,5 +162,4 @@ AgentCredentialsPrivate::AgentCredentialsPrivate()
 	{
 		Logger::Instance().info("No UUID found; agent requires pairing");
 	}
-	gFirst = false;
 }
