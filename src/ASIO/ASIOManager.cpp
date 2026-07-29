@@ -1,7 +1,7 @@
 #include "ASIOManager.hpp"
 #include "ASIOManager_p.hpp"
 
-#include "Logger.hpp"
+#include "Log/Logger.hpp"
 
 #include <cstdlib>
 

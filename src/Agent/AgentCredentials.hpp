@@ -10,15 +10,15 @@ class AgentCredentialsPrivate;
 class AgentCredentials
 {
 public:
-									AgentCredentials();
-									~AgentCredentials();
+								AgentCredentials();
+								~AgentCredentials();
 
-	std::string_view				getPublicKey() const;
-	std::string_view				getPrivateKey() const;
-	std::optional<std::string_view>	getUUID() const;
-	std::string_view				generateUUID();
+	std::string					getPublicKey() const;
+	std::string					getPrivateKey() const;
+	std::optional<std::string>	getUUID() const;
+	std::string					generateUUID();
 
-	std::string						signChallenge(std::string_view challenge) const;
+	std::string					signChallenge(std::string_view challenge) const;
 
 private:
 	std::unique_ptr<AgentCredentialsPrivate>	m_p;

@@ -1,6 +1,6 @@
-#include "Agent.hpp"
-#include "ASIOManager.hpp"
-#include "Logger.hpp"
+#include "Agent/Agent.hpp"
+#include "ASIO/ASIOManager.hpp"
+#include "Log/Logger.hpp"
 
 #include <boost/asio.hpp>
 

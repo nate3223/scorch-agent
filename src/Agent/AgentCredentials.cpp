@@ -1,8 +1,8 @@
 #include "AgentCredentials.hpp"
 #include "AgentCredentials_p.hpp"
 
-#include "KeychainUtils.hpp"
-#include "Logger.hpp"
+#include "Keychain/KeychainUtils.hpp"
+#include "Log/Logger.hpp"
 
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
@@ -102,22 +102,22 @@ AgentCredentials::AgentCredentials()
 
 AgentCredentials::~AgentCredentials() = default;
 
-std::string_view AgentCredentials::getPublicKey() const
+std::string AgentCredentials::getPublicKey() const
 {
 	return m_p->m_publicKey;
 }
 
-std::string_view AgentCredentials::getPrivateKey() const
+std::string AgentCredentials::getPrivateKey() const
 {
 	return m_p->m_privateKey;
 }
 
-std::optional<std::string_view> AgentCredentials::getUUID() const
+std::optional<std::string> AgentCredentials::getUUID() const
 {
 	return m_p->m_uuid;
 }
 
-std::string_view AgentCredentials::generateUUID()
+std::string AgentCredentials::generateUUID()
 {
 	m_p->m_uuid = GenerateUUID();
 	KeychainUtils::Save(kUUID, *m_p->m_uuid);

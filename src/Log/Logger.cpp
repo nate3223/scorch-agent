@@ -15,7 +15,8 @@ spdlog::logger& Logger::Instance()
 
 Logger::Logger()
 {
-	spdlog::init_thread_pool(8192, 1);
+	if (! spdlog::thread_pool())
+		spdlog::init_thread_pool(8192, 1);
 
 	std::vector<spdlog::sink_ptr> sinks;
 

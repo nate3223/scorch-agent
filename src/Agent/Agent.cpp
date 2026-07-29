@@ -1,9 +1,10 @@
 #include "Agent.hpp"
 #include "Agent_p.hpp"
 
-#include "ASIOManager.hpp"
-#include "Logger.hpp"
+#include "ASIO/ASIOManager.hpp"
+#include "Log/Logger.hpp"
 
+#include <cstring>
 #include <format>
 #include <iostream>
 #include <optional>
@@ -12,7 +13,12 @@ namespace
 {
 	constexpr auto kHostname = "localhost";
 	constexpr auto kPort = "3224";
-	constexpr std::uint32_t kMaxMessageSize = 1024 * 1024;
+	constexpr uint32_t kMaxMessageSize = 1024 * 1024;
+
+	inline bool IsInvalidInititationMessage(const ServerMessage& serverMessage)
+	{
+		return serverMessage.getMessageId() != 0 || serverMessage.getReplyTo() != 0;
+	}
 }
 
 template <>
@@ -41,31 +47,11 @@ Agent::~Agent() = default;
 
 asio::awaitable<void> Agent::run()
 {
-	while (true)
-	{
-		{
-			try
-			{
-				m_p->m_context.reset();
-				m_p->m_context.emplace(co_await m_p->connect(kHostname, kPort));
-				co_await m_p->eventLoop();
-			}
-			catch (const std::exception& e)
-			{
-				Logger::Instance().error(e.what());
-			}
-
-			if (m_p->m_context)
-				m_p->close(std::move(*m_p->m_context));
-			m_p->m_context.reset();
-		}
-
-		asio::steady_timer timer(co_await asio::this_coro::executor);
-
-		timer.expires_after(std::chrono::seconds(5));
-
-		co_await timer.async_wait(asio::use_awaitable);
-	}
+	co_await asio::co_spawn(
+		m_p->m_strand,
+		m_p->run(),
+		asio::use_awaitable
+	);
 }
 
 AgentState Agent::state() const
@@ -74,10 +60,35 @@ AgentState Agent::state() const
 }
 
 AgentPrivate::AgentPrivate()
-	: m_resolver(ASIOManager::Instance().ioContext())
+	: m_strand(asio::make_strand(ASIOManager::Instance().ioContext()))
+	, m_resolver(m_strand)
 	, m_logger(Logger::Instance())
 {
 
+}
+
+asio::awaitable<void> AgentPrivate::run()
+{
+	while (true)
+	{
+		try
+		{
+			m_context = co_await connect(kHostname, kPort);
+			co_await eventLoop();
+		}
+		catch (const std::exception& error)
+		{
+			m_logger.error("Agent connection failed: {}", error.what());
+		}
+
+		if (m_context)
+			disconnect(m_context);
+		m_context.reset();
+
+		asio::steady_timer timer(co_await asio::this_coro::executor);
+		timer.expires_after(std::chrono::seconds(5));
+		co_await timer.async_wait(asio::use_awaitable);
+	}
 }
 
 void AgentPrivate::setState(AgentState state) const
@@ -86,7 +97,7 @@ void AgentPrivate::setState(AgentState state) const
 		m_logger.debug(std::format("Changing state to {}", state));
 }
 
-asio::awaitable<AgentPrivate::Context> AgentPrivate::connect(std::string host, std::string port)
+asio::awaitable<std::shared_ptr<AgentPrivate::Context>> AgentPrivate::connect(std::string host, std::string port)
 {
 	setState(AgentState::Connecting);
 	m_logger.info(std::format("Connecting to {} on port {}...", host, port));
@@ -111,11 +122,11 @@ asio::awaitable<AgentPrivate::Context> AgentPrivate::connect(std::string host, s
 	co_await socket.async_handshake(asio::ssl::stream_base::client, asio::use_awaitable);
 
 	m_logger.info("Connected");
-	co_return Context{
-		.host	= std::move(host),
-		.port	= std::move(port),
-		.socket	= std::move(socket),
-	};
+	co_return std::make_shared<Context>(
+		std::move(host),
+		std::move(port),
+		std::move(socket)
+	);
 }
 
 asio::awaitable<void> AgentPrivate::eventLoop()
@@ -132,7 +143,7 @@ asio::awaitable<void> AgentPrivate::eventLoop()
 				co_await pair();
 				break;
 			case AgentState::Connected:
-				co_await listen();
+				co_await connected();
 				break;
 			default:
 				break;
@@ -143,15 +154,15 @@ asio::awaitable<void> AgentPrivate::eventLoop()
 asio::awaitable<void> AgentPrivate::authenticate()
 {
 	assert(m_state == AgentState::Connecting || m_state == AgentState::Authenticating);
-	bool success = true;
 
-	if (! m_credentials.getUUID().has_value())
+	const std::optional<std::string> uuidOpt = m_credentials.getUUID();
+	if (! uuidOpt.has_value())
 	{
 		setState(AgentState::Pairing);
 		co_return;
 	}
 
-	std::string_view uuid = *m_credentials.getUUID();
+	const std::string& uuid = *uuidOpt;
 
 	m_logger.info("Authenticating...");
 	setState(AgentState::Authenticating);
@@ -162,50 +173,66 @@ asio::awaitable<void> AgentPrivate::authenticate()
 	});
 
 	std::string signature;
-
-	co_await readServerMessage([this, &signature, &success](ServerMessage& serverMessage) {
-		if (! serverMessage.isAuthenticationInitiation())
-		{
-			m_logger.error("Unexpected server response. Expected AuthenticationInitiation");
-			success = false;
-			return;
-		}
-
-		auto authInitResponse = serverMessage.getAuthenticationInitiation();
-		if (authInitResponse.isInvalidUuid())
-		{
-			m_logger.info("Server says UUID is invalid. Requesting new pairing code.");
-			setState(AgentState::Pairing);
-			success = false;
-			return;
-		}
-		else if (! authInitResponse.isChallenge())
-		{
-			m_logger.error("AuthenticationInitiation was not successful for an unknown reason.");
-			success = false;
-			return;
-		}
-
-		auto challengeMessage = authInitResponse.getChallenge().getChallenge();
-		std::string_view challenge(
-			reinterpret_cast<const char*>(challengeMessage.begin()),
-			challengeMessage.size()
+	ReceivedMessage initiation = co_await readServerMessage(m_context);
+	ServerMessage initiationMessage = initiation.message;
+	if (IsInvalidInititationMessage(initiationMessage) || ! initiationMessage.isAuthenticationInitiation())
+	{
+		co_await handleUnexpectedInitializationMessage(
+			initiationMessage,
+			"AuthenticationInitiation"
 		);
-
-		m_logger.debug("Challenge received. Signing");
-		try
-		{
-			signature = m_credentials.signChallenge(challenge);
-		}
-		catch (const std::exception& e)
-		{
-			m_logger.error("Failed to sign challenge: {}", e.what());
-			success = false;
-			return;
-		}
-	});
-	if (! success)
 		co_return;
+	}
+
+	auto authInitResponse = initiationMessage.getAuthenticationInitiation();
+	if (authInitResponse.isInvalidUuid())
+	{
+		m_logger.info("Server says UUID is invalid. Requesting new pairing code.");
+		setState(AgentState::Pairing);
+		co_return;
+	}
+	if (authInitResponse.isRetry())
+	{
+		m_logger.info("Server requested an authentication retry");
+		setState(AgentState::Connecting);
+		co_return;
+	}
+	if (! authInitResponse.isChallenge())
+	{
+		co_await handleUnexpectedInitializationMessage(
+			initiationMessage,
+			"AuthenticationInitiation challenge, invalidUuid, or retry"
+		);
+		co_return;
+	}
+
+	auto challengeMessage = authInitResponse.getChallenge().getChallenge();
+	std::string_view challenge(
+		reinterpret_cast<const char*>(challengeMessage.begin()),
+		challengeMessage.size()
+	);
+
+	m_logger.debug("Challenge received. Signing");
+	bool challengeSigned = true;
+	try
+	{
+		signature = m_credentials.signChallenge(challenge);
+	}
+	catch (const std::exception& error)
+	{
+		m_logger.error("Failed to sign challenge: {}", error.what());
+		challengeSigned = false;
+	}
+
+	if (! challengeSigned)
+	{
+		auto context = m_context;
+		co_await sendAgentMessage([](AgentMessage& agentMessage) {
+			agentMessage.initError().setMessage("Unable to process authentication challenge");
+		}, 0, 0, context);
+		disconnect(context);
+		co_return;
+	}
 
 	co_await sendAgentMessage([&signature](AgentMessage& agentMessage) {
 		auto authReq = agentMessage.initAuthenticationRequest();
@@ -218,30 +245,32 @@ asio::awaitable<void> AgentPrivate::authenticate()
 		);
 	});
 
-	co_await readServerMessage([this, &success](ServerMessage& serverMessage) {
-		if (! serverMessage.isAuthenticationResult())
-		{
-			m_logger.error("Unexpected server response. Expected AuthenticationResult");
-			success = false;
-			return;
-		}
-
-		auto authResult = serverMessage.getAuthenticationResult();
-		if (authResult.isChallengeFailed())
-		{
-			m_logger.error("Challenge failed. Retrying");
-			success = false;
-			return;
-		}
-		else if (! authResult.isSuccess())
-		{
-			m_logger.error("Authentication Request was not successful for an unknown reason");
-			success = false;
-			return;
-		}
-	});
-	if (! success)
+	ReceivedMessage result = co_await readServerMessage(m_context);
+	ServerMessage resultMessage = result.message;
+	if (IsInvalidInititationMessage(resultMessage) || ! resultMessage.isAuthenticationResult())
+	{
+		co_await handleUnexpectedInitializationMessage(
+			resultMessage,
+			"AuthenticationResult"
+		);
 		co_return;
+	}
+
+	auto authResult = resultMessage.getAuthenticationResult();
+	if (authResult.isChallengeFailed())
+	{
+		m_logger.error("Challenge failed. Retrying");
+		setState(AgentState::Connecting);
+		co_return;
+	}
+	if (! authResult.isSuccess())
+	{
+		co_await handleUnexpectedInitializationMessage(
+			resultMessage,
+			"AuthenticationResult success or challengeFailed"
+		);
+		co_return;
+	}
 
 	m_logger.info("Authentication successful");
 	setState(AgentState::Connected);
@@ -252,12 +281,12 @@ asio::awaitable<void> AgentPrivate::authenticate()
 asio::awaitable<void> AgentPrivate::pair()
 {
 	assert(m_state == AgentState::Pairing);
-	bool success = true;
 
-	co_await sendAgentMessage([this](AgentMessage& agentMessage) {
+	const std::string uuid = m_credentials.generateUUID();
+
+	co_await sendAgentMessage([this, &uuid](AgentMessage& agentMessage) {
 		auto pairRequest = agentMessage.initPair();
 
-		std::string_view uuid = m_credentials.generateUUID();
 		pairRequest.setUuid(kj::StringPtr(uuid.data(), uuid.size()));
 		pairRequest.setPublicKey(
 			kj::ArrayPtr<const kj::byte>(
@@ -268,60 +297,71 @@ asio::awaitable<void> AgentPrivate::pair()
 	});
 
 	std::string pairCode;
-
-	co_await readServerMessage([this, &success, &pairCode](ServerMessage& serverMessage) {
-		if (! serverMessage.isPairCode())
-		{
-			m_logger.error("Unexpected server response. Expected PairCode");
-			success = false;
-			return;
-		}
-
-		auto pairCodeResult = serverMessage.getPairCode();
-		success = pairCodeResult.isValid();
-		if (pairCodeResult.isInvalid())
-			m_logger.info("Server rejected UUID. Retrying");
-		else if (pairCodeResult.isRetry())
-			m_logger.info("Server asked to request for another pairing code. Retrying");
-
-		if (! success)
-			return;
-
-		pairCode = pairCodeResult.getValid().getCode();
-	});
-	if (! success)
+	ReceivedMessage pairCodeMessage = co_await readServerMessage(m_context);
+	ServerMessage pairCodeEnvelope = pairCodeMessage.message;
+	if (IsInvalidInititationMessage(pairCodeEnvelope) || ! pairCodeEnvelope.isPairCode())
+	{
+		co_await handleUnexpectedInitializationMessage(
+			pairCodeEnvelope,
+			"PairCode"
+		);
 		co_return;
+	}
+
+	auto pairCodeResult = pairCodeEnvelope.getPairCode();
+	if (pairCodeResult.isInvalid())
+	{
+		m_logger.info("Server rejected UUID. Retrying");
+		co_return;
+	}
+	if (pairCodeResult.isRetry())
+	{
+		m_logger.info("Server asked to request another pairing code. Retrying");
+		co_return;
+	}
+	if (! pairCodeResult.isValid())
+	{
+		co_await handleUnexpectedInitializationMessage(
+			pairCodeEnvelope,
+			"PairCode valid, invalid, or retry"
+		);
+		co_return;
+	}
+
+	pairCode = pairCodeResult.getValid().getCode();
 
 	m_logger.info(std::format("Pairing Code received: {}", pairCode));
 
 	std::string pairingInfo;
 	// Await user entering pair code
-	co_await readServerMessage([this, &success, &pairingInfo](ServerMessage& serverMessage) {
-		if (! serverMessage.isPairingResult())
-		{
-			m_logger.error("Unexpected server response. Expected PairingResult");
-			success = false;
-			return;
-		}
-
-		auto pairingResult = serverMessage.getPairingResult();
-		if (pairingResult.isTimedOut())
-		{
-			m_logger.info("Pairing timed out. Requesting new Pairing Code");
-			success = false;
-			return;
-		}
-		else if (! pairingResult.isSuccess())
-		{
-			m_logger.error("Pairing was not succesful due to an unknown reason");
-			success = false;
-			return;
-		}
-		auto pairingSuccess = pairingResult.getSuccess();
-		pairingInfo = pairingSuccess.getPairingInfo();
-	});
-	if (! success)
+	ReceivedMessage pairingMessage = co_await readServerMessage(m_context);
+	ServerMessage pairingEnvelope = pairingMessage.message;
+	if (IsInvalidInititationMessage(pairingEnvelope) || ! pairingEnvelope.isPairingResult())
+	{
+		co_await handleUnexpectedInitializationMessage(
+			pairingEnvelope,
+			"PairingResult"
+		);
 		co_return;
+	}
+
+	auto pairingResult = pairingEnvelope.getPairingResult();
+	if (pairingResult.isTimedOut())
+	{
+		m_logger.info("Pairing timed out. Requesting new PairCode");
+		co_return;
+	}
+	if (! pairingResult.isSuccess())
+	{
+		co_await handleUnexpectedInitializationMessage(
+			pairingEnvelope,
+			"PairingResult success or timedOut"
+		);
+		co_return;
+	}
+
+	auto pairingSuccess = pairingResult.getSuccess();
+	pairingInfo = pairingSuccess.getPairingInfo();
 
 	m_logger.info("Pairing request confirmed: {}", pairingInfo);
 	std::cout << "Did you authorize this pairing request? " << pairingInfo << " [y / N]: " << std::flush;
@@ -340,24 +380,212 @@ asio::awaitable<void> AgentPrivate::pair()
 	setState(AgentState::Authenticating);
 }
 
-asio::awaitable<void> AgentPrivate::listen()
+asio::awaitable<void> AgentPrivate::handleUnexpectedInitializationMessage(ServerMessage message, std::string_view expected)
+{
+	auto context = m_context;
+
+	if (message.isError())
+	{
+		m_logger.warn(
+			"Server reset initialization: {}",
+			message.getError().getMessage().cStr()
+		);
+	}
+	else
+	{
+		const std::string error = std::format(
+			"Unexpected initialization message; expected {}",
+			expected
+		);
+		m_logger.warn(error);
+
+		co_await sendAgentMessage([&error](AgentMessage& agentMessage) {
+			agentMessage.initError().setMessage(
+				kj::StringPtr(error.data(), error.size())
+			);
+		}, 0, 0, context);
+	}
+
+	// Restart on a fresh stream so queued messages from the failed
+	// initialization attempt cannot trigger another reset.
+	disconnect(context);
+}
+
+asio::awaitable<void> AgentPrivate::connected()
 {
 	assert(m_state == AgentState::Connected);
+	auto context = m_context;
 
-	while (m_state == AgentState::Connected)
+	try
 	{
-		auto message = co_await read();
+		while (m_state == AgentState::Connected && m_context == context)
+		{
+			auto received = co_await readServerMessage(context);
+			const uint64_t messageId = received.message.getMessageId();
+			const uint64_t replyTo = received.message.getReplyTo();
+
+			if (messageId == 0)
+			{
+				m_logger.warn("Ignoring connected message without an ID");
+				continue;
+			}
+
+			if (replyTo != 0)
+			{
+				onResponse(context, received.message);
+				continue;
+			}
+
+			asio::co_spawn(
+				m_strand,
+				[this, context, received = std::move(received)]() mutable -> asio::awaitable<void> {
+					try
+					{
+						co_await handleConnectedMessage(context, std::move(received));
+					}
+					catch (const std::exception& error)
+					{
+						m_logger.error("Failed to handle server message: {}", error.what());
+						disconnect(context);
+					}
+					catch (...)
+					{
+						m_logger.error("Failed to handle server message: unknown error");
+						disconnect(context);
+					}
+				},
+				asio::detached
+			);
+		}
 	}
+	catch (...)
+	{
+		failPendingRequests(context, std::current_exception());
+		throw;
+	}
+
+	if (! context->pendingRequests.empty())
+	{
+		failPendingRequests(
+			context,
+			std::make_exception_ptr(std::runtime_error("Server disconnected"))
+		);
+	}
+}
+
+asio::awaitable<void> AgentPrivate::handleConnectedMessage(std::shared_ptr<Context> context,ReceivedMessage received)
+{
+	const uint64_t messageId = received.message.getMessageId();
+
+	switch (received.message.which())
+	{
+		case scorch::protocol::ServerMessage::HEARTBEAT:
+			co_await onHeartbeat(context, received.message.getHeartbeat(), messageId);
+			break;
+
+		case scorch::protocol::ServerMessage::COMMAND:
+			co_await onCommandRequest(context, received.message.getCommand(), messageId);
+			break;
+
+		case scorch::protocol::ServerMessage::ERROR:
+			m_logger.error(
+				"Received uncorrelated protocol error from server: {}",
+				received.message.getError().getMessage().cStr()
+			);
+			break;
+
+		default:
+			m_logger.warn(
+				"Server sent unsupported message type {}",
+				static_cast<unsigned int>(received.message.which())
+			);
+			co_await sendProtocolError(context, messageId, "Unsupported message");
+			break;
+	}
+}
+
+asio::awaitable<void> AgentPrivate::onHeartbeat(std::shared_ptr<Context> context, scorch::protocol::Heartbeat::Reader heartbeat, uint64_t requestId)
+{
+	m_logger.debug("Received heartbeat");
+	auto ms = heartbeat.getTimestamp();
+	co_await sendAgentMessage([ms](AgentMessage& agentMessage) {
+		auto heartbeat = agentMessage.initHeartbeat();
+		heartbeat.setTimestamp(ms);
+	}, nextMessageId(context), requestId, context);
 
 	co_return;
 }
 
-asio::awaitable<Buffer> AgentPrivate::read()
+asio::awaitable<void> AgentPrivate::onCommandRequest(std::shared_ptr<Context> context, scorch::protocol::CommandRequest::Reader request, uint64_t requestId)
+{
+	auto which = request.which();
+	m_logger.debug("Received Command Request ({})", static_cast<int>(which));
+
+	using Type = decltype(which);
+	switch (which)
+	{
+		case Type::HTTP:
+			co_await onHTTPCommand(context, request.getHttp(), requestId);
+			co_return;
+		default:
+			break;
+	}
+
+	const std::string errorMessage = std::format("Unknown Command Request ({})", static_cast<int>(which));
+	m_logger.warn(errorMessage);
+	co_await sendAgentMessage([errorMessage](AgentMessage& agentMessage) {
+		auto commandResponse = agentMessage.initCommand();
+		commandResponse.setError(kj::StringPtr(errorMessage.data(), errorMessage.size()));
+	}, nextMessageId(context), requestId, context);
+
+	co_return;
+}
+
+void AgentPrivate::onResponse(const std::shared_ptr<Context>& context, ServerMessage response)
+{
+	const uint64_t replyTo = response.getReplyTo();
+	m_logger.debug("Received response to message {}", replyTo);
+
+	auto it = context->pendingRequests.find(replyTo);
+	if (it == context->pendingRequests.end())
+	{
+		m_logger.warn("Server replied to unknown message {}", replyTo);
+		return;
+	}
+
+	auto pending = it->second;
+	context->pendingRequests.erase(it);
+	pending->complete(response);
+}
+
+asio::awaitable<void> AgentPrivate::sendProtocolError(std::shared_ptr<Context> context, uint64_t replyTo, std::string_view message)
+{
+	co_await sendAgentMessage([message](AgentMessage& agentMessage) {
+		agentMessage.initError().setMessage(kj::StringPtr(message.data(), message.size()));
+	}, nextMessageId(context), replyTo, context);
+}
+
+asio::awaitable<void> AgentPrivate::onHTTPCommand(std::shared_ptr<Context> context, scorch::protocol::HttpCommand::Reader command, uint64_t requestId)
+{
+	const std::string errorMessage = std::format(
+		"HTTP command for {} is not implemented",
+		command.getUrl().cStr()
+	);
+	m_logger.warn(errorMessage);
+
+	co_await sendAgentMessage([errorMessage](AgentMessage& agentMessage) {
+		agentMessage.initCommand().setError(
+			kj::StringPtr(errorMessage.data(), errorMessage.size())
+		);
+	}, nextMessageId(context), requestId, context);
+}
+
+asio::awaitable<Buffer> AgentPrivate::read(const std::shared_ptr<Context>& context)
 {
 	uint32_t size;
 
 	co_await asio::async_read(
-		m_context->socket,
+		context->socket,
 		asio::buffer(&size, sizeof(size)),
 		asio::use_awaitable
 	);
@@ -369,7 +597,7 @@ asio::awaitable<Buffer> AgentPrivate::read()
 	Buffer buffer(size);
 
 	co_await asio::async_read(
-		m_context->socket,
+		context->socket,
 		asio::buffer(buffer),
 		asio::use_awaitable
 	);
@@ -377,35 +605,72 @@ asio::awaitable<Buffer> AgentPrivate::read()
 	co_return buffer;
 }
 
-asio::awaitable<void> AgentPrivate::handleMessage(std::string_view message)
+asio::awaitable<ReceivedMessage> AgentPrivate::readServerMessage(const std::shared_ptr<Context>& context)
 {
-	co_return;
+	auto response = co_await read(context);
+
+	if (response.size() % sizeof(capnp::word) != 0)
+		throw std::runtime_error("Invalid Cap'n Proto message size");
+
+	co_return ReceivedMessage(std::move(response));
 }
 
-asio::awaitable<void> AgentPrivate::writeMessage(capnp::MallocMessageBuilder& message)
+asio::awaitable<void> AgentPrivate::writeMessage(capnp::MallocMessageBuilder& message, std::shared_ptr<Context> context)
 {
 	auto serialized = capnp::messageToFlatArray(message);
 	auto bytes = serialized.asBytes();
 
-	std::uint32_t size = htonl(static_cast<std::uint32_t>(bytes.size()));
+	const uint32_t size = htonl(static_cast<uint32_t>(bytes.size()));
+	Buffer frame(sizeof(size) + bytes.size());
 
-	co_await asio::async_write(
-		m_context->socket,
-		asio::buffer(&size, sizeof(size)),
-		asio::use_awaitable
-	);
+	std::memcpy(frame.data(), &size, sizeof(size));
+	std::memcpy(frame.data() + sizeof(size), bytes.begin(), bytes.size());
 
+	auto lock = co_await context->writeMutex.lock();
 	co_await asio::async_write(
-		m_context->socket,
-		asio::buffer(bytes.begin(), bytes.size()),
+		context->socket,
+		asio::buffer(frame),
 		asio::use_awaitable
 	);
 }
 
-void AgentPrivate::close(Context&& ctx)
+uint64_t AgentPrivate::nextMessageId(const std::shared_ptr<Context>& context)
 {
-	m_logger.info("Closing websocket");
+	uint64_t id = ++context->messageId;
+
+	while (id == 0 || context->pendingRequests.contains(id))
+		id = ++context->messageId;
+	
+	return id;
+}
+
+void AgentPrivate::failPendingRequests(const std::shared_ptr<Context>& context,std::exception_ptr error)
+{
+	for (auto& entry : context->pendingRequests)
+		entry.second->fail(error);
+
+	context->pendingRequests.clear();
+}
+
+void AgentPrivate::disconnect(const std::shared_ptr<Context>& context)
+{
+	if (m_context == context)
+		setState(AgentState::Disconnected);
+
+	if (! context->pendingRequests.empty())
+	{
+		failPendingRequests(
+			context,
+			std::make_exception_ptr(std::runtime_error("Server disconnected"))
+		);
+	}
+
+	if (! context->socket.next_layer().is_open())
+		return;
+
+	m_logger.info("Closing server connection");
 	boost::system::error_code ec;
-	ctx.socket.next_layer().shutdown(tcp::socket::shutdown_both, ec);
-	ctx.socket.next_layer().close(ec);
+	context->socket.next_layer().cancel(ec);
+	context->socket.next_layer().shutdown(tcp::socket::shutdown_both, ec);
+	context->socket.next_layer().close(ec);
 }

@@ -34,46 +34,92 @@ FetchContent_MakeAvailable(keychain)
 find_package(Boost REQUIRED COMPONENTS asio uuid)
 find_package(OpenSSL REQUIRED)
 
-# Create an executable
-add_executable(${PROJECT_NAME}
-	src/main.cpp
-	
-	src/Agent/Agent.cpp
-	src/Agent/AgentCredentials.cpp
-
-	src/ASIO/ASIOManager.cpp
-
-	src/Keychain/KeychainUtils.cpp
-
-	src/Log/Logger.cpp
-)
-
-set_target_properties(${PROJECT_NAME} PROPERTIES
-	CXX_STANDARD 23
-	CXX_STANDARD_REQUIRED ON
-)
-
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    Boost::asio
-	Boost::uuid
-    OpenSSL::SSL
-    OpenSSL::Crypto
-	Scorch::Protocol
-	keychain
-)
-
 if(NOT TARGET spdlog)
 	# Stand-alone build
 	find_package(spdlog REQUIRED)
 endif()
-target_link_libraries(${PROJECT_NAME} PRIVATE spdlog::spdlog $<$<BOOL:${MINGW}>:ws2_32>)
 
-add_compile_options(-Wall -Wextra -Wpedantic -Wpessimizing-move -Wredundant-move)
+# Create an executable
+add_executable(${PROJECT_NAME})
+add_executable(Scorch::Client ALIAS ${PROJECT_NAME})
 
-target_include_directories(${PROJECT_NAME} PRIVATE
-	src
-	src/Agent
-	src/ASIO
-	src/Keychain
-	src/Log
+target_sources(${PROJECT_NAME}
+	PUBLIC
+		src/main.cpp
+
+		src/Agent/Agent.cpp
+		src/Agent/Agent.hpp
+		src/Agent/Agent_p.hpp
+		src/Agent/AgentCredentials.cpp
+		src/Agent/AgentCredentials.hpp
+		src/Agent/AgentCredentials_p.hpp
+
+		src/ASIO/ASIOManager.cpp
+		src/ASIO/ASIOManager.hpp
+		src/ASIO/ASIOManager_p.hpp
+
+		src/Keychain/KeychainUtils.cpp
+		src/Keychain/KeychainUtils.hpp
+
+		src/Log/Logger.cpp
+		src/Log/Logger.hpp
 )
+
+target_compile_features(${PROJECT_NAME}
+	PUBLIC
+		cxx_std_23
+)
+
+target_compile_options(${PROJECT_NAME}
+	PRIVATE
+		$<$<CXX_COMPILER_ID:MSVC>:/W4>
+		$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:
+			-Wall
+			-Wextra
+			-Wpedantic
+			-Wpessimizing-move
+			-Wredundant-move
+		>
+)
+
+target_include_directories(${PROJECT_NAME}
+	PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(${PROJECT_NAME}
+	PRIVATE
+		Boost::asio
+		Boost::uuid
+		OpenSSL::SSL
+		OpenSSL::Crypto
+		Scorch::Protocol
+		keychain
+		spdlog::spdlog
+		$<$<BOOL:${MINGW}>:ws2_32>
+)
+
+if(PROJECT_IS_TOP_LEVEL)
+	include(CTest)
+
+	if(BUILD_TESTING)
+		add_executable(ScorchAgentControlFlowTests
+			tests/AgentControlFlowTests.cpp
+		)
+
+		target_compile_features(ScorchAgentControlFlowTests PRIVATE cxx_std_23)
+		target_include_directories(ScorchAgentControlFlowTests PRIVATE
+			${CMAKE_CURRENT_SOURCE_DIR}/src
+		)
+		target_link_libraries(ScorchAgentControlFlowTests PRIVATE
+			Scorch::Protocol
+			Boost::asio
+			Boost::uuid
+			OpenSSL::SSL
+			OpenSSL::Crypto
+			spdlog::spdlog
+		)
+
+		add_test(NAME ScorchAgentControlFlowTests COMMAND ScorchAgentControlFlowTests)
+	endif()
+endif()
