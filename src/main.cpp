@@ -6,7 +6,7 @@
 
 int main(int argc, char* argv[])
 {
-	Logger::Instance().info("Started");
+	Logger::Instance().info("Scorch Agent started");
 
 	Agent agent;
 
@@ -15,7 +15,7 @@ int main(int argc, char* argv[])
 
 	ioContext.run();
 
-	Logger::Instance().info("Stopped");
+	Logger::Instance().info("Scorch Agent stopped");
 
 	return 0;
 }

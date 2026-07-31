@@ -121,7 +121,7 @@ std::string AgentCredentials::generateUUID()
 {
 	m_p->m_uuid = GenerateUUID();
 	KeychainUtils::Save(kUUID, *m_p->m_uuid);
-	Logger::Instance().info(std::format("Generated new UUID: {}", *m_p->m_uuid));
+	Logger::Instance().info(std::format("Generated new agent UUID: {}", *m_p->m_uuid));
 	return *m_p->m_uuid;
 }
 
@@ -145,7 +145,7 @@ AgentCredentialsPrivate::AgentCredentialsPrivate()
 	}
 	else
 	{
-		Logger::Instance().info("Generating keys for Agent credentials...");
+		Logger::Instance().info("Generating agent credential keys");
 		GenerateKeyPair(m_privateKey, m_publicKey);
 
 		KeychainUtils::Save(kPrivateKey, m_privateKey);
@@ -156,7 +156,7 @@ AgentCredentialsPrivate::AgentCredentialsPrivate()
 	if (uuid.has_value())
 	{
 		m_uuid = std::move(*uuid);
-		Logger::Instance().info(std::format("Retrieved UUID from keychain: {}", *m_uuid));
+		Logger::Instance().debug(std::format("Retrieved agent UUID from keychain: {}", *m_uuid));
 	}
 	else
 	{

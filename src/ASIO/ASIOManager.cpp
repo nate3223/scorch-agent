@@ -40,7 +40,7 @@ ASIOManagerPrivate::ASIOManagerPrivate()
 	const bool disableSSLVerification = (envValue != nullptr && std::string(envValue) == "1");
 	if (disableSSLVerification)
 	{
-		Logger::Instance().warn("SSL Verification Disabled. Be careful");
+		Logger::Instance().warn("TLS certificate verification is disabled");
 		m_sslContext.set_verify_mode(boost::asio::ssl::verify_none);
 	}
 	else

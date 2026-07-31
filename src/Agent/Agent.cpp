@@ -80,7 +80,7 @@ asio::awaitable<void> AgentPrivate::run()
 		}
 		catch (const std::exception& error)
 		{
-			m_logger.error("Agent connection failed: {}", error.what());
+			m_logger.error("Agent connection failed; retrying in 5 seconds: {}", error.what());
 		}
 
 		if (m_context)
@@ -102,7 +102,7 @@ void AgentPrivate::setState(AgentState state) const
 asio::awaitable<std::shared_ptr<AgentPrivate::Context>> AgentPrivate::connect(std::string host, std::string port)
 {
 	setState(AgentState::Connecting);
-	m_logger.info(std::format("Connecting to {} on port {}...", host, port));
+	m_logger.info(std::format("Connecting to Scorch server at {}:{}", host, port));
 
 	auto executor = co_await asio::this_coro::executor;
 
@@ -120,10 +120,10 @@ asio::awaitable<std::shared_ptr<AgentPrivate::Context>> AgentPrivate::connect(st
 
 	co_await asio::async_connect(socket.next_layer(), endpoints, asio::use_awaitable);
 
-	m_logger.info("Awaiting TLS handshake...");
+	m_logger.debug("Starting TLS handshake");
 	co_await socket.async_handshake(asio::ssl::stream_base::client, asio::use_awaitable);
 
-	m_logger.info("Connected");
+	m_logger.info("Connected to Scorch server");
 	co_return std::make_shared<Context>(
 		std::move(host),
 		std::move(port),
@@ -166,7 +166,7 @@ asio::awaitable<void> AgentPrivate::authenticate()
 
 	const std::string& uuid = *uuidOpt;
 
-	m_logger.info("Authenticating...");
+	m_logger.info("Authenticating agent {}", uuid);
 	setState(AgentState::Authenticating);
 
 	co_await sendAgentMessage([uuid](AgentMessage& agentMessage) {
@@ -189,13 +189,13 @@ asio::awaitable<void> AgentPrivate::authenticate()
 	auto authInitResponse = initiationMessage.getAuthenticationInitiation();
 	if (authInitResponse.isInvalidUuid())
 	{
-		m_logger.info("Server says UUID is invalid. Requesting new pairing code.");
+		m_logger.warn("Server rejected agent UUID {}; requesting a new pairing code", uuid);
 		setState(AgentState::Pairing);
 		co_return;
 	}
 	if (authInitResponse.isRetry())
 	{
-		m_logger.info("Server requested an authentication retry");
+		m_logger.warn("Server requested an authentication retry for agent {}", uuid);
 		setState(AgentState::Connecting);
 		co_return;
 	}
@@ -214,7 +214,7 @@ asio::awaitable<void> AgentPrivate::authenticate()
 		challengeMessage.size()
 	);
 
-	m_logger.debug("Challenge received. Signing");
+	m_logger.debug("Signing authentication challenge for agent {}", uuid);
 	bool challengeSigned = true;
 	try
 	{
@@ -261,7 +261,7 @@ asio::awaitable<void> AgentPrivate::authenticate()
 	auto authResult = resultMessage.getAuthenticationResult();
 	if (authResult.isChallengeFailed())
 	{
-		m_logger.error("Challenge failed. Retrying");
+		m_logger.warn("Authentication challenge failed for agent {}; retrying", uuid);
 		setState(AgentState::Connecting);
 		co_return;
 	}
@@ -274,7 +274,7 @@ asio::awaitable<void> AgentPrivate::authenticate()
 		co_return;
 	}
 
-	m_logger.info("Authentication successful");
+	m_logger.info("Agent {} authenticated successfully", uuid);
 	setState(AgentState::Connected);
 
 	co_return;
@@ -313,12 +313,12 @@ asio::awaitable<void> AgentPrivate::pair()
 	auto pairCodeResult = pairCodeEnvelope.getPairCode();
 	if (pairCodeResult.isInvalid())
 	{
-		m_logger.info("Server rejected UUID. Retrying");
+		m_logger.warn("Server rejected generated agent UUID {}; retrying", uuid);
 		co_return;
 	}
 	if (pairCodeResult.isRetry())
 	{
-		m_logger.info("Server asked to request another pairing code. Retrying");
+		m_logger.warn("Server requested another pairing code for agent {}", uuid);
 		co_return;
 	}
 	if (! pairCodeResult.isValid())
@@ -332,7 +332,7 @@ asio::awaitable<void> AgentPrivate::pair()
 
 	pairCode = pairCodeResult.getValid().getCode();
 
-	m_logger.info(std::format("Pairing Code received: {}", pairCode));
+	m_logger.info(std::format("Pairing code: {}", pairCode));
 
 	std::string pairingInfo;
 	// Await user entering pair code
@@ -350,7 +350,7 @@ asio::awaitable<void> AgentPrivate::pair()
 	auto pairingResult = pairingEnvelope.getPairingResult();
 	if (pairingResult.isTimedOut())
 	{
-		m_logger.info("Pairing timed out. Requesting new PairCode");
+		m_logger.warn("Pairing code expired; requesting another");
 		co_return;
 	}
 	if (! pairingResult.isSuccess())
@@ -365,12 +365,13 @@ asio::awaitable<void> AgentPrivate::pair()
 	auto pairingSuccess = pairingResult.getSuccess();
 	pairingInfo = pairingSuccess.getPairingInfo();
 
-	m_logger.info("Pairing request confirmed: {}", pairingInfo);
+	m_logger.info("Pairing approval requested");
 	std::cout << "Did you authorize this pairing request? " << pairingInfo << " [y / N]: " << std::flush;
 	std::string response;
 	std::getline(std::cin, response);
 
 	const bool authorised = response == "y" || response == "Y";
+	m_logger.info("Pairing request {}", authorised ? "approved" : "rejected");
 	co_await sendAgentMessage([authorised](AgentMessage& agentMessage) {
 		auto pairingConfirmation = agentMessage.initPairingConfirmation();
 		if (authorised)
@@ -440,19 +441,19 @@ asio::awaitable<void> AgentPrivate::connected()
 
 			asio::co_spawn(
 				m_strand,
-				[this, context, received = std::move(received)]() mutable -> asio::awaitable<void> {
+				[this, context, messageId, received = std::move(received)]() mutable -> asio::awaitable<void> {
 					try
 					{
 						co_await handleConnectedMessage(context, std::move(received));
 					}
 					catch (const std::exception& error)
 					{
-						m_logger.error("Failed to handle server message: {}", error.what());
+						m_logger.error("Failed to handle server message {}: {}", messageId, error.what());
 						disconnect(context);
 					}
 					catch (...)
 					{
-						m_logger.error("Failed to handle server message: unknown error");
+						m_logger.error("Failed to handle server message {}: unknown error", messageId);
 						disconnect(context);
 					}
 				},
@@ -495,14 +496,16 @@ asio::awaitable<void> AgentPrivate::handleConnectedMessage(std::shared_ptr<Conte
 
 		case scorch::protocol::ServerMessage::ERROR:
 			m_logger.error(
-				"Received uncorrelated protocol error from server: {}",
+				"Received uncorrelated protocol error in message {}: {}",
+				messageId,
 				received.message.getError().getMessage().cStr()
 			);
 			break;
 
 		default:
 			m_logger.warn(
-				"Server sent unsupported message type {}",
+				"Server message {} has unsupported type {}",
+				messageId,
 				static_cast<unsigned int>(received.message.which())
 			);
 			co_await sendProtocolError(context, messageId, "Unsupported message");
@@ -512,7 +515,7 @@ asio::awaitable<void> AgentPrivate::handleConnectedMessage(std::shared_ptr<Conte
 
 asio::awaitable<void> AgentPrivate::onHeartbeat(std::shared_ptr<Context> context, scorch::protocol::Heartbeat::Reader heartbeat, uint64_t requestId)
 {
-	m_logger.debug("Received heartbeat");
+	m_logger.trace("Received heartbeat request {}", requestId);
 	auto ms = heartbeat.getTimestamp();
 	co_await sendAgentMessage([ms](AgentMessage& agentMessage) {
 		auto heartbeat = agentMessage.initHeartbeat();
@@ -525,7 +528,7 @@ asio::awaitable<void> AgentPrivate::onHeartbeat(std::shared_ptr<Context> context
 asio::awaitable<void> AgentPrivate::onCommandRequest(std::shared_ptr<Context> context, scorch::protocol::CommandRequest::Reader request, uint64_t requestId)
 {
 	auto which = request.which();
-	m_logger.debug("Received Command Request ({})", static_cast<int>(which));
+	m_logger.trace("Received command request {} with type {}", requestId, static_cast<int>(which));
 
 	using Type = decltype(which);
 	switch (which)
@@ -537,8 +540,8 @@ asio::awaitable<void> AgentPrivate::onCommandRequest(std::shared_ptr<Context> co
 			break;
 	}
 
-	const std::string errorMessage = std::format("Unknown Command Request ({})", static_cast<int>(which));
-	m_logger.warn(errorMessage);
+	const std::string errorMessage = std::format("Unknown command request type {}", static_cast<int>(which));
+	m_logger.warn("Command request {} has unknown type {}", requestId, static_cast<int>(which));
 	co_await sendAgentMessage([errorMessage](AgentMessage& agentMessage) {
 		auto commandResponse = agentMessage.initCommand();
 		commandResponse.setError(kj::StringPtr(errorMessage.data(), errorMessage.size()));
@@ -553,7 +556,9 @@ asio::awaitable<void> AgentPrivate::onShareRequest(
 	uint64_t requestId
 )
 {
+	m_logger.info("Share approval requested for message {}", requestId);
 	const bool approved = co_await requestShareApproval(request.getInfo().cStr());
+	m_logger.info("Share request {} {}", requestId, approved ? "approved" : "rejected");
 
 	co_await sendAgentMessage([approved](AgentMessage& agentMessage) {
 		auto confirmation = agentMessage.initShareConfirmation();
@@ -582,7 +587,7 @@ asio::awaitable<bool> AgentPrivate::requestShareApproval(std::string info)
 void AgentPrivate::onResponse(const std::shared_ptr<Context>& context, ServerMessage response)
 {
 	const uint64_t replyTo = response.getReplyTo();
-	m_logger.debug("Received response to message {}", replyTo);
+	m_logger.trace("Received response to message {}", replyTo);
 
 	auto it = context->pendingRequests.find(replyTo);
 	if (it == context->pendingRequests.end())
@@ -608,6 +613,7 @@ asio::awaitable<void> AgentPrivate::onHTTPCommand(std::shared_ptr<Context> conte
 	scorch::agent::http::Request request;
 	request.url = command.getUrl().cStr();
 	request.method = command.getMethod().cStr();
+	m_logger.debug("Executing HTTP command {} with method {}", requestId, request.method);
 
 	const auto requestHeaders = command.getHeaders();
 	request.headers.reserve(requestHeaders.size());
@@ -656,7 +662,7 @@ asio::awaitable<void> AgentPrivate::onHTTPCommand(std::shared_ptr<Context> conte
 		co_return;
 	}
 
-	m_logger.info(
+	m_logger.debug(
 		"HTTP command {} completed with status {}",
 		requestId,
 		response->status
@@ -780,7 +786,7 @@ void AgentPrivate::disconnect(const std::shared_ptr<Context>& context)
 	if (! context->socket.next_layer().is_open())
 		return;
 
-	m_logger.info("Closing server connection");
+	m_logger.info("Closing connection to Scorch server");
 	boost::system::error_code ec;
 	context->socket.next_layer().cancel(ec);
 	context->socket.next_layer().shutdown(tcp::socket::shutdown_both, ec);

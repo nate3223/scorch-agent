@@ -7,6 +7,15 @@
 
 #include <memory>
 
+namespace
+{
+#ifndef NDEBUG
+	constexpr auto kLogLevel = spdlog::level::debug;
+#else
+	constexpr auto kLogLevel = spdlog::level::info;
+#endif
+}
+
 spdlog::logger& Logger::Instance()
 {
 	static Logger sLogger;
@@ -28,7 +37,7 @@ Logger::Logger()
 	m_logger = std::make_shared<spdlog::async_logger>("logs", sinks.begin(), sinks.end(), spdlog::thread_pool(), spdlog::async_overflow_policy::block);
 
 	m_logger->set_pattern("%^%Y-%m-%d %H:%M:%S.%e [%L] [th#%t]%$ : %v");
-	m_logger->set_level(spdlog::level::level_enum::debug);
+	m_logger->set_level(kLogLevel);
 	m_logger->flush_on(spdlog::level::err);
 
 	spdlog::register_logger(m_logger);
